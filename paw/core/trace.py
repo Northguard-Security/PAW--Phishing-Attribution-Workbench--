@@ -6,6 +6,7 @@ from ..util.fsutil import ensure_dir, write_json, write_text, sanitize_case_id, 
 from .parser_mail import parse_mail, load_mail
 from .mime_analysis import analyze_mime
 from .header_inventory import inventory_headers, inventory_coverage
+from .mime_body_evidence import preserve_body_parts, body_evidence_coverage
 from .evidence import seal_case
 from .runtime import mark_stage, read_progress
 from .received import normalize_received
@@ -418,6 +419,8 @@ def trace_one(eml_path, lang, stix, abuse, anchor, no_egress, profile="default",
         except Exception as e:
             print(f"[pgp] signing failed: {e}")
     write_json(os.path.join(case_dir, 'mime_analysis.json'), mime_result['metadata'])
+    body_inventory = preserve_body_parts(mime_result, b, os.path.join(case_dir, 'mime_body'))
+    write_json(os.path.join(case_dir, 'mime_body_evidence.json'), body_inventory)
     body_text = mime_result['body_text']
     from .mime_analysis import extract_urls
     from .url_evidence import extract_mime_url_candidates, build_url_evidence
@@ -506,6 +509,7 @@ def trace_one(eml_path, lang, stix, abuse, anchor, no_egress, profile="default",
                     'network_enrichment': {'status': 'skipped' if no_egress else 'not_evaluated', 'reason': 'no-egress' if no_egress else 'Individual lookup outcomes apply'},
                     'attachment_metadata': {'status': 'not_evaluated'}}
     stage_status['header_inventory'] = inventory_coverage(header_inventory)
+    stage_status['mime_body_evidence'] = body_evidence_coverage(body_inventory)
     url_results = deobfuscated.get('urls', [])
     stage_status['url_interpretation'] = {
         'status':'partial' if any(r.get('status') != 'completed' or r.get('analysis_status') == 'partial'
@@ -1135,6 +1139,10 @@ def trace_one(eml_path, lang, stix, abuse, anchor, no_egress, profile="default",
         f"limited: {header_inventory['limited_field_count']}\n"
         f"- Extraction status: {header_inventory['status']}. "
         "Ordered raw parser values and derived text; unverified header claims.\n"
+        "\n## MIME Body Evidence\n"
+        f"- Artifact: mime_body_evidence.json; preserved parts: {body_inventory['part_count']}; "
+        f"payload bytes: {body_inventory['payload_bytes']}; status: {body_inventory['status']}\n"
+        "- Per-part transfer-decoded bytes and derived charset text; exact original: input.eml.\n"
         "\n## Received Path\n")
     for i,h in enumerate(hops, start=1):
         tech_md += f"- Hop {i}: by={h.get('by')} from={h.get('from')} ip={h.get('ip')} date={h.get('date')} helo={h.get('helo')} ptr={h.get('ptr')} skew_s={h.get('skew_s')} fqdn_ok={h.get('fqdn_ok')} helo_ptr_match={h.get('helo_ptr_match')} role={h.get('role')}\n"

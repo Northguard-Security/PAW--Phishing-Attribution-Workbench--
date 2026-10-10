@@ -21,7 +21,10 @@ def parse_message_bytes(raw, limits=MimeLimits()):
         if count > limits.max_parts: raise MimeLimitExceeded('MIME part count limit exceeded during parsing')
         return EmailMessage(**kwargs)
     try:
-        return BytesParser(_class=bounded_factory, policy=policy.default).parsebytes(raw)
+        message = BytesParser(_class=bounded_factory, policy=policy.default).parsebytes(raw)
+        # Retain the bounded wire source for checks that serialization can hide.
+        message._paw_source_bytes = raw
+        return message
     except RecursionError as exc:
         raise MimeLimitExceeded('MIME nesting exceeds parser capability') from exc
 

@@ -32,7 +32,7 @@ def parse(value, limits=MimeLimits()):
 
 class MimeContracts(unittest.TestCase):
     def test_declared_charset_preserves_accents_and_encoded_headers(self):
-        raw = b'From: sender@example.com\r\nSubject: =?iso-8859-1?q?Pi=F9_caff=E8?=\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\nPi\xf9 caff\xe8'
+        raw = b'From: sender@example.com\r\nSubject: =?iso-8859-1?q?Pi=F9_caff=E8?=\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: 8bit\r\n\r\nPi\xf9 caff\xe8'
         result = analyze_mime(parse_message_bytes(raw))
         self.assertEqual(result['body_text'], 'Più caffè')
         self.assertEqual(str(parse_eml_bytes(raw)['subject']), 'Più caffè')

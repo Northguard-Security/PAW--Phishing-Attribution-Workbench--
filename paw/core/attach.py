@@ -62,6 +62,9 @@ def scan_attachments(msg_obj, mime_result=None, evidence_dir=None):
         item.update(part_id=part_id, disposition=attachment['disposition'], byte_source=attachment['byte_source'],
                     decoding_defects=attachment['defects'])
         if attachment['defects']: item['status'] = 'partial'
+        if 'transfer_decoding' in attachment:
+            item['transfer_decoding'] = dict(attachment['transfer_decoding'])
+            item['status'] = 'partial'
         if evidence_dir is not None:
             root = Path(evidence_dir)
             root.mkdir(parents=True, exist_ok=True)

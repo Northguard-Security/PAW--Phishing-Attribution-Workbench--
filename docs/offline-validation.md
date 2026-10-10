@@ -320,6 +320,13 @@ or uses a default example case. See [canary status](canary-status.md) for the
 measured reproduction and rejection tests. Existing observations remain readable;
 the offline analysis engine and deferred detonation/Sentinel paths are unchanged.
 
+## MIME body evidence
+
+New cases preserve individual [MIME body evidence](mime-body-evidence.md) with
+transfer-decoded payload bytes and separate charset-derived text. This makes
+alternatives and replacement-decoding provenance inspectable per part without
+changing the existing aggregate analysis or attachment/scoring contracts.
+
 ## Top-level header inventory
 
 New cases also expose a separate [top-level header inventory](header-inventory.md)

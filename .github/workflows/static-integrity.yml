@@ -65,6 +65,9 @@ jobs:
       - name: Verify MIME and attachment evidence contracts
         run: python -m unittest discover -s tests -p 'test_mime_contracts.py' -v
 
+      - name: Verify per-part body byte evidence and charset provenance
+        run: python -m unittest discover -s tests -p 'test_mime_body_evidence.py' -v
+
       - name: Verify URL identity, candidate provenance and decoding bounds
         run: python -m unittest discover -s tests -p 'test_url_contracts.py' -v
 
@@ -178,3 +181,6 @@ jobs:
 
       - name: Verify actual offline header inventory and sealed HTTP exports
         run: python tests/integration_header_inventory_real.py
+
+      - name: Verify actual offline MIME body evidence and sealed HTTP exports
+        run: python tests/integration_mime_body_evidence_real.py
