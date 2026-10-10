@@ -190,3 +190,27 @@ jobs:
 
       - name: Verify actual offline MIME tree headers and sealed HTTP exports
         run: python tests/integration_mime_header_inventory_real.py
+
+      - name: Verify bounded attachment ZIP inventories and coverage
+        run: python -m unittest discover -s tests -p 'test_archive_inventory.py' -v
+
+      - name: Verify actual offline attachment ZIP inventories and exports
+        run: python tests/integration_archive_inventory_real.py
+
+  archive-runtime-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install offline engine and loopback API test dependencies
+        run: python -m pip install 'blake3>=1,<2' 'dnspython>=2.4.2,<3' 'tldextract>=5,<6' 'dkimpy>=1.1.4,<2' 'cryptography>=42,<47' 'psutil>=5.9,<8' 'beautifulsoup4>=4.12,<5' 'fastapi>=0.104,<1' 'python-multipart>=0.0.9,<1' 'requests>=2.31,<3' 'rich>=13.7,<14' 'ipwhois>=1.2,<2' 'python-dateutil>=2.8.2,<3' 'uvicorn>=0.24,<1'
+      - name: Verify Unicode ZIP parser views and bounded name accounting
+        run: python -m unittest discover -s tests -p 'test_archive_inventory.py' -v
+      - name: Verify actual offline Unicode ZIP CLI and HTTP exports
+        run: python tests/integration_archive_inventory_real.py

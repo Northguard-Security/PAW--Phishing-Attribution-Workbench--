@@ -339,6 +339,12 @@ for part/container and encapsulated parser-node headers. Ordered fields retain
 separate inner-message scope, raw/derived provenance and global capture budgets.
 The original top-level inventory and selected analysis contracts remain available.
 
+The [attachment ZIP inventory audit](attachment-archive-inventory.md) preserves
+bounded member records and parser names, makes omissions explicit and propagates
+ZIP limits/reader errors to attachment coverage while retaining other attachments.
+It inventories declarations; archive members, macros and malware remain separate
+unverified content-analysis scopes.
+
 ## Local DKIM public key evidence
 
 Analysis presets accept `--dkim-keys` and HTTP analysis accepts `options.dkim_keys`.
