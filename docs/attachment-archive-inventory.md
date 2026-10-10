@@ -22,6 +22,9 @@ Actual `full --no-egress` cases on the merged baseline reproduced:
   A 5,014-byte replacement passed a 4,096-byte limit, and 100 replacements retained
   301,500 name bytes while accounting for only 100. A `safe.txt` legacy name with
   a `../evil.txt` replacement also escaped the original-only unsafe-path check.
+- A later same-input full CLI run reproduced a Unicode Path value containing
+  `safe<NUL>../evil.txt`: both parser names were `safe`, so inspecting those views
+  alone still lost the NUL observation.
 
 The corrected reader keeps a bounded member prefix with explicit omissions,
 preserves original parser names within name budgets and isolates supported reader
@@ -66,6 +69,19 @@ identities. `macro_container_entries` has explicit scope
 `inventoried_entries_with_retained_parser_names`; missing markers beyond that
 scope cannot establish absence of macros.
 
+`unicode_path_check` additionally inspects version-1 Unicode Path extra values
+with matching declared legacy-name CRC, before NUL/separator sanitization. It
+stores only field/matched/ignored/unsafe/NUL counts, status, scope and issues;
+extra-field name text is not retained or copied into markers. Every matching
+declaration is inspected, including duplicates and values later overridden by
+another field. A CRC association is not authentication. Nonmatching CRC/version
+fields are ignored. Unsupported/malformed Unicode values report an unavailable
+check; without a known unsafe observation the path value becomes null rather than
+false, archive status becomes partial, and attachment coverage follows. Newer ZIP
+readers may instead reject the malformed field before producing member records.
+The walk holds one value at a time within the existing ZIP extra-field byte span
+and retained-entry prefix, under the existing input/worker bounds.
+
 These are additional extraction bounds. The standard ZIP parser reads the
 central directory before the retained-prefix/name limits apply. Existing MIME
 input/decoded-byte limits and supervised worker memory/deadline limits still
@@ -87,9 +103,9 @@ keep their explicit unavailable/unknown contracts. No inventory limit/error adds
 maliciousness, authentication or attribution points.
 
 New metadata remains in `attachments.json`, the stable case-detail API and sealed
-ZIP exports. Historical artifacts remain readable. Twenty-one unit tests cover the
+ZIP exports. Historical artifacts remain readable. Twenty-five unit tests cover the
 reader/name/count/size families and preservation of other attachments. The actual
-offline integration uses 18 full CLI cases and eight loopback HTTP workers, with
+offline integration uses 21 full CLI cases and eleven loopback HTTP workers, with
 independent standard-parser reconstruction of retained/omitted records and names,
 original payload bytes, seals, coverage and exports. Constructed ZIPs are
 regression inputs, not classification truth. The private 20-message original EML
@@ -100,3 +116,5 @@ CI exercises the archive tests on Python 3.11, 3.12 and 3.13. Python 3.11 does n
 apply Unicode Path extras; newer readers can replace the effective name. Each
 runtime's actual parser views determine the metadata; the tests assert the newer
 reader behavior explicitly as well as the limits and path observations.
+The additional unsanitized path observation is also available on Python 3.11,
+even though that reader does not replace its effective filename with the extra.

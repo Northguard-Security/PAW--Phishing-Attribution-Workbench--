@@ -47,6 +47,37 @@ def make_unicode_zip(entries, crc_valid=True):
     return buffer.getvalue()
 
 
+def expected_unicode_paths(entry):
+    """Independent extra-field walk; no PAW collector or sanitization helper."""
+    result={'status':'completed','scope':'crc_matched_version_1_unicode_path_extra_values',
+        'field_count':0,'matched_name_count':0,'ignored_field_count':0,
+        'unsafe_name_count':0,'nul_name_count':0,'issues':[]}
+    spelling=entry.orig_filename.encode('utf-8' if entry.flag_bits&0x800 else 'cp437')
+    position=0
+    while len(entry.extra)-position>=4:
+        tag,length=struct.unpack('<HH',entry.extra[position:position+4])
+        body=entry.extra[position+4:position+4+length]; position+=4+length
+        assert len(body)==length
+        if tag!=0x7075: continue
+        result['field_count']+=1
+        if len(body)<5:
+            if 'malformed_unicode_path_extra' not in result['issues']: result['issues'].append('malformed_unicode_path_extra')
+            continue
+        version,crc=struct.unpack('<BI',body[:5])
+        if version!=1 or crc!=zlib.crc32(spelling):
+            result['ignored_field_count']+=1; continue
+        try: name=body[5:].decode('utf-8')
+        except UnicodeDecodeError:
+            if 'invalid_unicode_path_utf8' not in result['issues']: result['issues'].append('invalid_unicode_path_utf8')
+            continue
+        result['matched_name_count']+=1
+        view=name.replace('\\','/')
+        result['unsafe_name_count']+=int(view.startswith('/') or '..' in view.split('/') or ':' in view or '\x00' in view)
+        result['nul_name_count']+=int('\x00' in view)
+    if result['issues']: result['status']='not_evaluated'
+    return result
+
+
 def check_archive(stored,payload):
     if not payload.startswith((b'PK\x03\x04',b'PK\x05\x06',b'PK\x07\x08')):
         assert stored['status']=='not_evaluated'
@@ -60,7 +91,9 @@ def check_archive(stored,payload):
     assert stored['inventoried_entry_count']==len(stored['entries'])==min(1000,len(entries))
     assert stored['omitted_entry_count']==max(0,len(entries)-1000)
     assert stored['declared_total_size']==sum(entry.file_size for entry in entries)
-    names_bytes=limited_names=0; macro_names=[]
+    names_bytes=limited_names=0; macro_names=[]; issues=[]
+    if len(entries)>1000: issues.append('entry_count_limit')
+    if sum(e.file_size for e in entries)>100*1024*1024: issues.append('declared_total_size_limit')
     for index,(field,entry) in enumerate(zip(stored['entries'],entries)):
         original=entry.orig_filename; size=len(original.encode('utf-8'))
         parser_size=len(entry.filename.encode('utf-8'))
@@ -72,6 +105,12 @@ def check_archive(stored,payload):
         assert field['parser_name_utf8_bytes']==parser_size
         normalized=[view.replace('\\','/') for view in (original,entry.filename)]
         unsafe=any(view.startswith('/') or '..' in view.split('/') or ':' in view or '\x00' in view for view in normalized)
+        extra_check=expected_unicode_paths(entry)
+        assert field['unicode_path_check']==extra_check
+        unsafe=unsafe or bool(extra_check['unsafe_name_count'])
+        if extra_check['status']!='completed':
+            if 'unicode_path_check_unavailable' not in issues: issues.append('unicode_path_check_unavailable')
+            if not unsafe: unsafe=None
         assert field['unsafe_extraction_path']==unsafe
         if keep:
             assert field['name']==entry.filename and field['original_name']==original
@@ -83,6 +122,8 @@ def check_archive(stored,payload):
             assert field['name_status']=='limited'
             assert field['name_issues']==['entry_name_size_limit' if max(size,parser_size)>4096 else 'entry_name_byte_budget']
             limited_names+=1
+        for issue in field['name_issues']:
+            if issue not in issues: issues.append(issue)
     assert stored['captured_name_utf8_bytes']==names_bytes and stored['limited_name_count']==limited_names
     assert names_bytes<=262144
     assert all(len(field[key].encode('utf-8'))<=4096 for field in stored['entries']
@@ -91,14 +132,9 @@ def check_archive(stored,payload):
         for key in ('name','original_name') if field[key] is not None)<=2*names_bytes
     assert stored['macro_container_entries']==macro_names
     assert stored['macro_container_entries_scope']=='inventoried_entries_with_retained_parser_names'
-    issues=[]
-    if len(entries)>1000: issues.append('entry_count_limit')
-    if sum(e.file_size for e in entries)>100*1024*1024: issues.append('declared_total_size_limit')
-    for field in stored['entries']:
-        for issue in field['name_issues']:
-            if issue not in issues: issues.append(issue)
     assert stored['issues']==issues
-    assert stored['status']==('limited' if issues else 'metadata_only')
+    limits=any(issue!='unicode_path_check_unavailable' for issue in issues)
+    assert stored['status']==('limited' if limits else 'partial' if issues else 'metadata_only')
 
 
 def check_case(case,raw):
@@ -116,7 +152,7 @@ def check_case(case,raw):
         assert (case/item['evidence_path']).resolve().is_relative_to((case/'attachments').resolve())
         assert (case/item['evidence_path']).read_bytes()==payload
         check_archive(item['archive'],payload)
-        assert item['status']==('partial' if item['archive']['status'] in {'limited','error'} else 'metadata_only')
+        assert item['status']==('partial' if item['archive']['status'] in {'limited','error','partial'} else 'metadata_only')
         assert item['assessment_status']=='partial' and item['risk_score'] is None and item['ole_macro'] is None
         assert item['risk_level']=='not_evaluated'
         assert item['macro_analysis']['status']==item['mime_detection']['status']==item['malware_analysis']['status']=='not_evaluated'
@@ -155,6 +191,9 @@ def main():
         'unicode-budget.eml':[make_unicode_zip([(str(index),'n'*3000+'vbaProject.bin') for index in range(100)])],
         'unicode-paths.eml':[make_unicode_zip([('safe.txt','../evil.txt'),('../legacy','safe.txt')])],
         'unicode-ignored.eml':[make_unicode_zip([('safe.txt','../'+'n'*5000)],crc_valid=False)],
+        'unicode-nul.eml':[make_unicode_zip([('safe','safe\x00../evil.txt'),('legacy','safe\x00'+'x'*5000)])],
+        'unicode-nul-ignored.eml':[make_unicode_zip([('safe','safe\x00../evil.txt')],crc_valid=False)],
+        'unicode-invalid.eml':[normal,make_unicode_zip([('safe','path')]).replace(b'path',b'pat\xff'),normal],
         'mixed.eml':[b'PK\x03\x04broken',normal,make_zip([('same',b'a'),('same',b'b'),('../path',b'')])]}
     samples={}
     for name,values in payloads.items():
@@ -180,6 +219,11 @@ def main():
         assert inventories['nul-name.eml'][0]['archive']['entries'][0]['original_name']=='file\x000000.txt'
         assert inventories['nul-name.eml'][0]['archive']['entries'][0]['unsafe_extraction_path']
         assert inventories['name-budget.eml'][0]['archive']['limited_name_count']>0
+        for field in inventories['unicode-nul.eml'][0]['archive']['entries']:
+            assert field['unsafe_extraction_path'] is True and field['unicode_path_check']['nul_name_count']==1
+        ignored=inventories['unicode-nul-ignored.eml'][0]['archive']['entries'][0]
+        assert ignored['unsafe_extraction_path'] is False and ignored['unicode_path_check']['ignored_field_count']==1
+        assert [item['status'] for item in inventories['unicode-invalid.eml']]==['metadata_only','partial','metadata_only']
         if sys.version_info >= (3,12):
             assert inventories['unicode-large.eml'][0]['archive']['limited_name_count']==1
             assert inventories['unicode-large.eml'][0]['archive']['macro_container_entries']==[]
@@ -208,7 +252,8 @@ def main():
                     except (urllib.error.URLError,TimeoutError): time.sleep(.1)
                 else: raise TimeoutError('API startup')
                 for name in ('over-count.eml','broken.eml','nul-name.eml','name-budget.eml','unsupported-reader.eml',
-                             'unicode-large.eml','unicode-budget.eml','unicode-paths.eml'):
+                             'unicode-large.eml','unicode-budget.eml','unicode-paths.eml',
+                             'unicode-nul.eml','unicode-nul-ignored.eml','unicode-invalid.eml'):
                     raw=samples[name]; boundary='paw_archive_inventory_fixture'
                     upload=(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\nContent-Type: message/rfc822\r\n\r\n'.encode()
                         +raw+f'\r\n--{boundary}--\r\n'.encode())
@@ -235,7 +280,7 @@ def main():
                 server.terminate()
                 try: server.wait(timeout=15)
                 except subprocess.TimeoutExpired: server.kill(); server.wait(timeout=15)
-    print('PASS: 18 actual full CLI cases and eight loopback HTTP workers; ZIP prefix/name budgets, both parser views including Unicode Path extras, partial coverage, unsupported-reader continuation, member-metadata-only boundaries, exact payloads, seals, API and ZIP. Offline; constructed inputs are not accuracy labels.')
+    print('PASS: 21 actual full CLI cases and eleven loopback HTTP workers; ZIP prefix/name budgets, both parser views and unsanitized Unicode Path observations, partial/unknown coverage, unsupported-reader continuation, member-metadata-only boundaries, exact payloads, seals, API and ZIP. Offline; constructed inputs are not accuracy labels.')
 
 
 if __name__=='__main__': main()

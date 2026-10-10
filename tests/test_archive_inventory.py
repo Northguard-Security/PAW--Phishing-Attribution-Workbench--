@@ -33,7 +33,7 @@ def make_unicode_zip(entries, version=1, crc_valid=True):
     with zipfile.ZipFile(buffer,'w') as archive:
         for legacy,unicode_name in entries:
             info = zipfile.ZipInfo(legacy)
-            crc = zlib.crc32(legacy.encode('ascii')) ^ (0 if crc_valid else 1)
+            crc = zlib.crc32(legacy.encode('utf-8')) ^ (0 if crc_valid else 1)
             data = struct.pack('<BI',version,crc)+unicode_name.encode('utf-8')
             info.extra = struct.pack('<HH',0x7075,len(data))+data
             archive.writestr(info,b'x')
@@ -121,7 +121,7 @@ class ArchiveInventoryTests(unittest.TestCase):
             for budget in (1,4096):
                 with self.subTest(legacy=legacy,name=name,budget=budget):
                     entry = archive_inventory(make_unicode_zip([(legacy,name)]),max_name_bytes=budget)['entries'][0]
-                    self.assertEqual(entry['unsafe_extraction_path'],sys.version_info >= (3,12) or legacy.startswith('../'))
+                    self.assertTrue(entry['unsafe_extraction_path'])
                     if budget==1: self.assertIsNone(entry['name'])
 
     def test_invalid_unicode_extra_crc_and_version_do_not_replace_parser_name(self):
@@ -132,6 +132,66 @@ class ArchiveInventoryTests(unittest.TestCase):
             self.assertFalse(entry['unsafe_extraction_path'])
             self.assertEqual(result['captured_name_utf8_bytes'],4)
             self.assertEqual(result['status'],'metadata_only')
+
+    def test_unicode_nul_observed_before_sanitization_even_when_names_match_or_omitted(self):
+        for legacy,name in (('safe','safe\x00../evil.txt'),('legacy','safe\x00'+'x'*5000)):
+            for budget in (1,4096):
+                with self.subTest(legacy=legacy,budget=budget):
+                    result = archive_inventory(make_unicode_zip([(legacy,name)]),max_name_bytes=budget)
+                    entry = result['entries'][0]
+                    self.assertTrue(entry['unsafe_extraction_path'])
+                    self.assertEqual(entry['unicode_path_check'],{
+                        'status':'completed','scope':'crc_matched_version_1_unicode_path_extra_values',
+                        'field_count':1,'matched_name_count':1,'ignored_field_count':0,
+                        'unsafe_name_count':1,'nul_name_count':1,'issues':[]})
+                    if budget==1: self.assertIsNone(entry['name'])
+                    if sys.version_info >= (3,12) and legacy=='safe':
+                        self.assertFalse(entry['name_normalized'])
+
+    def test_unicode_nul_with_wrong_crc_or_version_is_ignored(self):
+        for options in ({'crc_valid':False},{'version':2}):
+            entry = archive_inventory(make_unicode_zip([('safe','safe\x00../evil.txt')],**options))['entries'][0]
+            self.assertFalse(entry['unsafe_extraction_path'])
+            self.assertEqual(entry['unicode_path_check']['ignored_field_count'],1)
+            self.assertEqual(entry['unicode_path_check']['nul_name_count'],0)
+
+    def test_unicode_extra_crc_binding_utf8_cp437_and_multiple_declarations(self):
+        raw = make_unicode_zip([('é','safe\x00../evil.txt')])
+        self.assertTrue(archive_inventory(raw)['entries'][0]['unsafe_extraction_path'])
+        raw = make_unicode_zip([('cafx','safe\x00../evil.txt')])
+        raw = raw.replace(b'cafx',b'caf\x82').replace(struct.pack('<I',zlib.crc32(b'cafx')),
+            struct.pack('<I',zlib.crc32(b'caf\x82')))
+        entry = archive_inventory(raw)['entries'][0]
+        self.assertEqual(entry['original_name'],'café')
+        self.assertEqual(entry['unicode_path_check']['matched_name_count'],1)
+        self.assertTrue(entry['unsafe_extraction_path'])
+        info = zipfile.ZipInfo('safe')
+        fields = []
+        for name in ('safe\x00../evil.txt','safe'):
+            data = struct.pack('<BI',1,zlib.crc32(b'safe'))+name.encode('utf-8')
+            fields.append(struct.pack('<HH',0x7075,len(data))+data)
+        info.extra = b''.join(fields)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer,'w') as archive: archive.writestr(info,b'x')
+        entry = archive_inventory(buffer.getvalue())['entries'][0]
+        self.assertEqual(entry['name'],'safe')
+        self.assertEqual(entry['unicode_path_check']['matched_name_count'],2)
+        self.assertTrue(entry['unsafe_extraction_path'])
+
+    def test_unreadable_unicode_extra_is_unknown_not_safe_on_older_reader(self):
+        info = zipfile.ZipInfo('safe'); info.extra = struct.pack('<HHB',0x7075,1,1)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer,'w') as archive: archive.writestr(info,b'x')
+        for raw in (make_unicode_zip([('safe','path')]).replace(b'path',b'pat\xff'),
+                    buffer.getvalue()):
+            result = archive_inventory(raw)
+            if sys.version_info >= (3,12):
+                self.assertEqual(result['status'],'error')
+            else:
+                self.assertEqual(result['status'],'partial')
+                entry = result['entries'][0]
+                self.assertIsNone(entry['unsafe_extraction_path'])
+                self.assertEqual(entry['unicode_path_check']['status'],'not_evaluated')
 
     def test_unsafe_paths_and_original_separator_view(self):
         names = ('../a','dir/../a','/absolute','C:/drive','..\\escape','safe/a')
