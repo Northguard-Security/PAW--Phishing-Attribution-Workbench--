@@ -29,9 +29,20 @@ def inventory_headers(message, original, limits=HeaderInventoryLimits()):
     for value in vars(limits).values():
         if type(value) is not int or value <= 0:
             raise ValueError('Header inventory limits must be positive integers')
+    source = {'path':'input.eml', 'sha256':hashlib.sha256(original).hexdigest()}
+    return _inventory_headers(message, source, limits, 'parser_recognized_top_level_headers')
+
+
+def _inventory_headers(message, source, limits, scope, parsed_budget=None):
+    """Shared field capture. Internal callers supply validated remaining budgets.
+
+    Zero remaining field/raw budgets retain counts and explicit omissions; the
+    public top-level API still requires positive limits and keeps its schema.
+    """
+    parsed_bytes = 0
     total = len(message)
-    result = {'schema_version':1, 'scope':'parser_recognized_top_level_headers',
-        'verified':False, 'source':{'path':'input.eml', 'sha256':hashlib.sha256(original).hexdigest()},
+    result = {'schema_version':1, 'scope':scope,
+        'verified':False, 'source':dict(source),
         'raw_value_encoding':'base64 of parser ASCII/surrogateescape value octets',
         'raw_value_limitation':'Not complete field byte spans; parser strips initial whitespace and final line endings. Exact original: input.eml.',
         'parsed_value_source':'email policy header_fetch_parse; derived, unverified view',
@@ -85,6 +96,12 @@ def inventory_headers(message, original, limits=HeaderInventoryLimits()):
                             field['parsed_status'] = 'partial' if defects or replaced or non_ascii else 'completed'
                             if replaced:
                                 field['issues'].append('parsed_value_unencodable_characters')
+                            size = len(field['parsed_value'].encode('utf-8'))
+                            if parsed_budget is not None and parsed_bytes + size > parsed_budget:
+                                field.update(parsed_value=None, parsed_status='limited')
+                                field['issues'].append('parsed_byte_budget')
+                            else:
+                                parsed_bytes += size
                     except Exception as exc:
                         # An unsupported/malformed derived field must not erase
                         # its raw observation or fail the whole analysis.

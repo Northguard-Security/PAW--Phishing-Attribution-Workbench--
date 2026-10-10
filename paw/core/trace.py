@@ -6,6 +6,7 @@ from ..util.fsutil import ensure_dir, write_json, write_text, sanitize_case_id, 
 from .parser_mail import parse_mail, load_mail
 from .mime_analysis import analyze_mime
 from .header_inventory import inventory_headers, inventory_coverage
+from .mime_header_inventory import inventory_mime_headers, mime_header_coverage
 from .mime_body_evidence import preserve_body_parts, body_evidence_coverage
 from .evidence import seal_case
 from .runtime import mark_stage, read_progress
@@ -384,6 +385,7 @@ def trace_one(eml_path, lang, stix, abuse, anchor, no_egress, profile="default",
     violations_before = len(violations())
     headers, msg, b = load_mail(eml_path)
     header_inventory = inventory_headers(msg, b)
+    mime_header_inventory = inventory_mime_headers(msg, b)
     mime_result = analyze_mime(msg)
     case_id = sanitize_case_id(utc_now_iso().replace(":","").replace("Z","Z-") + uuid.uuid4().hex)
     case_dir = os.path.join(os.getcwd(), "cases", "case-" + case_id)
@@ -395,6 +397,7 @@ def trace_one(eml_path, lang, stix, abuse, anchor, no_egress, profile="default",
     with open(os.path.join(case_dir,"input.eml"), "wb") as original:
         original.write(b)
     write_json(os.path.join(case_dir, 'header_inventory.json'), header_inventory)
+    write_json(os.path.join(case_dir, 'mime_header_inventory.json'), mime_header_inventory)
     manifest = {"case_id": case_id, "created_utc": utc_now_iso(), "inputs":[{"path":"input.eml","blake3": eml_hash, "size": len(b)}], "policy":{"no_egress": bool(no_egress)}, "deobfuscation_weight": float(deob_weight)}
     manifest['source_name'] = os.path.basename(eml_path)
     if key_data is not None:
@@ -509,6 +512,7 @@ def trace_one(eml_path, lang, stix, abuse, anchor, no_egress, profile="default",
                     'network_enrichment': {'status': 'skipped' if no_egress else 'not_evaluated', 'reason': 'no-egress' if no_egress else 'Individual lookup outcomes apply'},
                     'attachment_metadata': {'status': 'not_evaluated'}}
     stage_status['header_inventory'] = inventory_coverage(header_inventory)
+    stage_status['mime_header_inventory'] = mime_header_coverage(mime_header_inventory)
     stage_status['mime_body_evidence'] = body_evidence_coverage(body_inventory)
     url_results = deobfuscated.get('urls', [])
     stage_status['url_interpretation'] = {
@@ -1139,6 +1143,11 @@ def trace_one(eml_path, lang, stix, abuse, anchor, no_egress, profile="default",
         f"limited: {header_inventory['limited_field_count']}\n"
         f"- Extraction status: {header_inventory['status']}. "
         "Ordered raw parser values and derived text; unverified header claims.\n"
+        "\n## MIME Header Inventory\n"
+        f"- Artifact: mime_header_inventory.json; parser nodes: {mime_header_inventory['total_part_count']}; "
+        f"inventoried fields: {mime_header_inventory['inventoried_field_count']}; "
+        f"omitted fields: {mime_header_inventory['omitted_field_count']}; status: {mime_header_inventory['status']}\n"
+        "- Per-node ordered observations; embedded header claims do not describe the outer sender. Exact original: input.eml.\n"
         "\n## MIME Body Evidence\n"
         f"- Artifact: mime_body_evidence.json; preserved parts: {body_inventory['part_count']}; "
         f"payload bytes: {body_inventory['payload_bytes']}; status: {body_inventory['status']}\n"
