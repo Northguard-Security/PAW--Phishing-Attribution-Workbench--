@@ -190,3 +190,9 @@ jobs:
 
       - name: Verify actual offline MIME tree headers and sealed HTTP exports
         run: python tests/integration_mime_header_inventory_real.py
+
+      - name: Verify bounded attachment ZIP inventories and coverage
+        run: python -m unittest discover -s tests -p 'test_archive_inventory.py' -v
+
+      - name: Verify actual offline attachment ZIP inventories and exports
+        run: python tests/integration_archive_inventory_real.py
