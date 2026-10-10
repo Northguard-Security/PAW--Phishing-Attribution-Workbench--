@@ -30,25 +30,31 @@ def archive_inventory(data, max_entries=1000, max_total_size=100 * 1024 * 1024,
             if len(entries) > max_entries: issues.append('entry_count_limit')
             if total > max_total_size: issues.append('declared_total_size_limit')
             for index, entry in enumerate(entries[:max_entries]):
-                # ZipInfo.filename can discard a NUL suffix or normalize separators.
-                # Retain its untruncated parser name and check that observation.
+                # NUL/separator normalization and Unicode extra fields can make
+                # these parser views differ. Bound and inspect both observations.
                 original = entry.orig_filename
-                name = original.replace('\\', '/')
-                path = PurePosixPath(name)
-                unsafe = path.is_absolute() or '..' in path.parts or ':' in name or '\x00' in name
+                views = {original, entry.filename}
+                unsafe = False
+                for view in views:
+                    name = view.replace('\\', '/')
+                    path = PurePosixPath(name)
+                    unsafe |= path.is_absolute() or '..' in path.parts or ':' in name or '\x00' in name
                 size = len(original.encode('utf-8'))
-                name_issue = ('entry_name_size_limit' if size > max_name_bytes else
-                    'entry_name_byte_budget' if name_bytes+size > max_total_name_bytes else None)
+                parser_size = len(entry.filename.encode('utf-8'))
+                retained_size = sum(len(view.encode('utf-8')) for view in views)
+                name_issue = ('entry_name_size_limit' if max(size, parser_size) > max_name_bytes else
+                    'entry_name_byte_budget' if name_bytes+retained_size > max_total_name_bytes else None)
                 if name_issue:
                     if name_issue not in issues: issues.append(name_issue)
                 else:
-                    name_bytes += size
+                    name_bytes += retained_size
                 inventory.append({'entry_index':index,
                     'name':None if name_issue else entry.filename,
                     'original_name':None if name_issue else original,
                     'name_status':'limited' if name_issue else 'captured',
                     'name_issues':[name_issue] if name_issue else [],
-                    'name_utf8_bytes':size, 'name_normalized':entry.filename != original,
+                    'name_utf8_bytes':size, 'parser_name_utf8_bytes':parser_size,
+                    'name_normalized':entry.filename != original,
                     'declared_size':entry.file_size,
                     'compressed_size':entry.compress_size, 'encrypted':bool(entry.flag_bits & 1),
                     'unsafe_extraction_path':unsafe})

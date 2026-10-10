@@ -3,10 +3,12 @@ import hashlib
 import io
 from pathlib import Path
 import struct
+import sys
 import tempfile
 import unittest
 import warnings
 import zipfile
+import zlib
 from email import policy
 from email.message import EmailMessage
 
@@ -22,6 +24,19 @@ def make_zip(entries):
         warnings.simplefilter('ignore',UserWarning)
         with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_STORED) as archive:
             for name,data in entries: archive.writestr(name,data)
+    return buffer.getvalue()
+
+
+def make_unicode_zip(entries, version=1, crc_valid=True):
+    """Actual Unicode Path extras with ASCII legacy central/local names."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer,'w') as archive:
+        for legacy,unicode_name in entries:
+            info = zipfile.ZipInfo(legacy)
+            crc = zlib.crc32(legacy.encode('ascii')) ^ (0 if crc_valid else 1)
+            data = struct.pack('<BI',version,crc)+unicode_name.encode('utf-8')
+            info.extra = struct.pack('<HH',0x7075,len(data))+data
+            archive.writestr(info,b'x')
     return buffer.getvalue()
 
 
@@ -65,7 +80,58 @@ class ArchiveInventoryTests(unittest.TestCase):
         self.assertEqual(entry['original_name'],'file\x000000.txt')
         self.assertTrue(entry['unsafe_extraction_path'])
         self.assertTrue(entry['name_normalized'])
-        self.assertEqual(result['captured_name_utf8_bytes'],13)
+        self.assertEqual(result['captured_name_utf8_bytes'],17)
+
+    def test_unicode_extra_per_view_limits_and_macro_marker(self):
+        raw = make_unicode_zip([('a','n'*5000+'vbaProject.bin')])
+        result = archive_inventory(raw)
+        if sys.version_info >= (3,12):
+            entry = result['entries'][0]
+            self.assertTrue(entry['name_normalized'])
+            self.assertEqual(entry['parser_name_utf8_bytes'],5014)
+            self.assertEqual(entry['name_issues'],['entry_name_size_limit'])
+            self.assertIsNone(entry['name']); self.assertIsNone(entry['original_name'])
+            self.assertEqual(result['captured_name_utf8_bytes'],0)
+            self.assertEqual(result['macro_container_entries'],[])
+        else:
+            self.assertEqual(result['entries'][0]['name'],'a')
+            self.assertEqual(result['status'],'metadata_only')
+
+    def test_unicode_extra_budget_boundaries_and_later_short_name(self):
+        raw = make_unicode_zip([('a','é'),('b','long'),('x','x')])
+        result = archive_inventory(raw,max_total_name_bytes=4)
+        if sys.version_info >= (3,12):
+            self.assertEqual([e['name'] for e in result['entries']],['é',None,'x'])
+            self.assertEqual(result['entries'][1]['name_issues'],['entry_name_byte_budget'])
+            self.assertEqual(result['captured_name_utf8_bytes'],4)
+            self.assertEqual(archive_inventory(make_unicode_zip([('a','é')]),max_name_bytes=2,
+                max_total_name_bytes=3)['status'],'metadata_only')
+            self.assertEqual(archive_inventory(make_unicode_zip([('a','é')]),max_total_name_bytes=2)['status'],'limited')
+        else:
+            self.assertEqual([e['name'] for e in result['entries']],['a','b','x'])
+
+    def test_short_unicode_view_cannot_hide_long_original(self):
+        result = archive_inventory(make_unicode_zip([('long-legacy','x')]),max_name_bytes=2)
+        self.assertEqual(result['entries'][0]['name_issues'],['entry_name_size_limit'])
+        self.assertIsNone(result['entries'][0]['name'])
+
+    def test_unicode_extra_checks_both_path_views_even_when_limited(self):
+        for legacy,name in (('safe.txt','../evil.txt'),('safe.txt','..\\evil.txt'),
+                            ('safe.txt','/absolute'),('safe.txt','C:/drive'),('../legacy','safe.txt')):
+            for budget in (1,4096):
+                with self.subTest(legacy=legacy,name=name,budget=budget):
+                    entry = archive_inventory(make_unicode_zip([(legacy,name)]),max_name_bytes=budget)['entries'][0]
+                    self.assertEqual(entry['unsafe_extraction_path'],sys.version_info >= (3,12) or legacy.startswith('../'))
+                    if budget==1: self.assertIsNone(entry['name'])
+
+    def test_invalid_unicode_extra_crc_and_version_do_not_replace_parser_name(self):
+        for options in ({'crc_valid':False},{'version':2}):
+            result = archive_inventory(make_unicode_zip([('safe','../'+'x'*5000)],**options))
+            entry = result['entries'][0]
+            self.assertEqual(entry['name'],'safe')
+            self.assertFalse(entry['unsafe_extraction_path'])
+            self.assertEqual(result['captured_name_utf8_bytes'],4)
+            self.assertEqual(result['status'],'metadata_only')
 
     def test_unsafe_paths_and_original_separator_view(self):
         names = ('../a','dir/../a','/absolute','C:/drive','..\\escape','safe/a')

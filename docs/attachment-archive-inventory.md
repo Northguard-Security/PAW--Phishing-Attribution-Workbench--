@@ -17,6 +17,11 @@ Actual `full --no-egress` cases on the merged baseline reproduced:
 - An unsupported ZIP reader version raised `NotImplementedError`. A message with
   three attachments retained one unlisted payload file, no `attachments.json`,
   and a failed attachment stage; the scanner stopped before the remaining parts.
+- Review reproduced two gaps in the initial correction on Python 3.13: valid
+  Unicode Path extras replaced `filename` without replacing `orig_filename`.
+  A 5,014-byte replacement passed a 4,096-byte limit, and 100 replacements retained
+  301,500 name bytes while accounting for only 100. A `safe.txt` legacy name with
+  a `../evil.txt` replacement also escaped the original-only unsafe-path check.
 
 The corrected reader keeps a bounded member prefix with explicit omissions,
 preserves original parser names within name budgets and isolates supported reader
@@ -32,14 +37,16 @@ Existing ordinary member fields remain, with these additions:
   separate records.
 - `original_name`: untruncated `ZipInfo.orig_filename`, distinct from the existing
   normalized parser `name`. This is decoded text, not an original name byte span.
-- `name_status`, `name_issues`, `name_utf8_bytes` and `name_normalized`: explicit
-  captured/limited names, declared parser-name size and normalization.
+- `name_status`, `name_issues`, `name_utf8_bytes`, `parser_name_utf8_bytes` and
+  `name_normalized`: captured/limited views, original and effective parser-name
+  UTF-8 sizes, and whether the views differ.
 - Inventory counts, omitted entry count, limited-name count, captured UTF-8 name
   bytes, issues, scope and `verified: false`.
 
-Default limits retain at most 1,000 member records, 4,096 UTF-8 bytes per original
-parser name and 262,144 captured original-name UTF-8 bytes per archive. A long or
-over-budget name becomes null in both name views, with its issue and position
+Default limits retain at most 1,000 member records, 4,096 UTF-8 bytes per name
+view and 262,144 captured name-view UTF-8 bytes per archive. Different original
+and effective views are both charged; identical views are charged once per entry.
+A long or over-budget name becomes null in both name views, with its issue and position
 retained; size/encryption/path observations remain available. Later shorter names
 can fit the remaining budget. Names reused by the macro-marker list are drawn
 only from retained names; their bytes are charged once against the name budget.
@@ -51,8 +58,8 @@ entries, including omitted records; exceeding it reports a limit, not an actual
 expansion attempt. A lower entry cap retains its prefix and full entry/declared
 size counts. Invalid, noninteger, boolean or nonpositive limits are rejected.
 
-Unsafe-path observations check the untruncated parser name, including NUL,
-absolute paths, parent traversal and drive/colon components. They describe
+Unsafe-path observations check both original and effective parser names, including
+NUL, absolute paths, parent traversal and drive/colon components. They describe
 declared path syntax, not an executed exploit or malware verdict. Member names
 never become filesystem paths: attachment files still use generated part/hash
 identities. `macro_container_entries` has explicit scope
@@ -80,11 +87,16 @@ keep their explicit unavailable/unknown contracts. No inventory limit/error adds
 maliciousness, authentication or attribution points.
 
 New metadata remains in `attachments.json`, the stable case-detail API and sealed
-ZIP exports. Historical artifacts remain readable. Sixteen unit tests cover the
+ZIP exports. Historical artifacts remain readable. Twenty-one unit tests cover the
 reader/name/count/size families and preservation of other attachments. The actual
-offline integration uses 14 full CLI cases and five loopback HTTP workers, with
+offline integration uses 18 full CLI cases and eight loopback HTTP workers, with
 independent standard-parser reconstruction of retained/omitted records and names,
 original payload bytes, seals, coverage and exports. Constructed ZIPs are
 regression inputs, not classification truth. The private 20-message original EML
 corpus has no attachments, so it can test regression of the other analysis paths
 but cannot validate real-world ZIP extraction quality.
+
+CI exercises the archive tests on Python 3.11, 3.12 and 3.13. Python 3.11 does not
+apply Unicode Path extras; newer readers can replace the effective name. Each
+runtime's actual parser views determine the metadata; the tests assert the newer
+reader behavior explicitly as well as the limits and path observations.

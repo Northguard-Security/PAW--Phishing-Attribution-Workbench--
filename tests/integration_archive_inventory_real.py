@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 import warnings
 import zipfile
+import zlib
 
 REPO=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(REPO))
@@ -32,6 +33,17 @@ def make_zip(entries):
         warnings.simplefilter('ignore',UserWarning)
         with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_DEFLATED) as archive:
             for name,data in entries: archive.writestr(name,data)
+    return buffer.getvalue()
+
+
+def make_unicode_zip(entries, crc_valid=True):
+    buffer=io.BytesIO()
+    with zipfile.ZipFile(buffer,'w') as archive:
+        for legacy,name in entries:
+            info=zipfile.ZipInfo(legacy)
+            field=struct.pack('<BI',1,zlib.crc32(legacy.encode('ascii'))^(0 if crc_valid else 1))+name.encode('utf-8')
+            info.extra=struct.pack('<HH',0x7075,len(field))+field
+            archive.writestr(info,b'Unicode Path regression content')
     return buffer.getvalue()
 
 
@@ -51,24 +63,32 @@ def check_archive(stored,payload):
     names_bytes=limited_names=0; macro_names=[]
     for index,(field,entry) in enumerate(zip(stored['entries'],entries)):
         original=entry.orig_filename; size=len(original.encode('utf-8'))
-        keep=size<=4096 and names_bytes+size<=262144
+        parser_size=len(entry.filename.encode('utf-8'))
+        retained_size=size+(parser_size if entry.filename!=original else 0)
+        keep=max(size,parser_size)<=4096 and names_bytes+retained_size<=262144
         assert field['entry_index']==index and field['declared_size']==entry.file_size
         assert field['compressed_size']==entry.compress_size and field['encrypted']==bool(entry.flag_bits&1)
         assert field['name_utf8_bytes']==size and field['name_normalized']==(entry.filename!=original)
-        normalized=original.replace('\\','/')
-        unsafe=normalized.startswith('/') or '..' in normalized.split('/') or ':' in normalized or '\x00' in normalized
+        assert field['parser_name_utf8_bytes']==parser_size
+        normalized=[view.replace('\\','/') for view in (original,entry.filename)]
+        unsafe=any(view.startswith('/') or '..' in view.split('/') or ':' in view or '\x00' in view for view in normalized)
         assert field['unsafe_extraction_path']==unsafe
         if keep:
             assert field['name']==entry.filename and field['original_name']==original
             assert field['name_status']=='captured' and not field['name_issues']
-            names_bytes+=size
+            names_bytes+=retained_size
             if entry.filename.lower().endswith('vbaproject.bin'): macro_names.append(entry.filename)
         else:
             assert field['name'] is None and field['original_name'] is None
             assert field['name_status']=='limited'
-            assert field['name_issues']==['entry_name_size_limit' if size>4096 else 'entry_name_byte_budget']
+            assert field['name_issues']==['entry_name_size_limit' if max(size,parser_size)>4096 else 'entry_name_byte_budget']
             limited_names+=1
     assert stored['captured_name_utf8_bytes']==names_bytes and stored['limited_name_count']==limited_names
+    assert names_bytes<=262144
+    assert all(len(field[key].encode('utf-8'))<=4096 for field in stored['entries']
+        for key in ('name','original_name') if field[key] is not None)
+    assert sum(len(field[key].encode('utf-8')) for field in stored['entries']
+        for key in ('name','original_name') if field[key] is not None)<=2*names_bytes
     assert stored['macro_container_entries']==macro_names
     assert stored['macro_container_entries_scope']=='inventoried_entries_with_retained_parser_names'
     issues=[]
@@ -131,6 +151,10 @@ def main():
         'unsupported-reader.eml':[normal,bytes(unsupported),normal],
         'prefixed.eml':[b'MZ harmless regression prefix'+normal],
         'nonzip.eml':[b'https://inner-archive.invalid/ Content is not a ZIP despite its MIME declaration'],
+        'unicode-large.eml':[make_unicode_zip([('a','n'*5000+'vbaProject.bin')])],
+        'unicode-budget.eml':[make_unicode_zip([(str(index),'n'*3000+'vbaProject.bin') for index in range(100)])],
+        'unicode-paths.eml':[make_unicode_zip([('safe.txt','../evil.txt'),('../legacy','safe.txt')])],
+        'unicode-ignored.eml':[make_unicode_zip([('safe.txt','../'+'n'*5000)],crc_valid=False)],
         'mixed.eml':[b'PK\x03\x04broken',normal,make_zip([('same',b'a'),('same',b'b'),('../path',b'')])]}
     samples={}
     for name,values in payloads.items():
@@ -156,6 +180,14 @@ def main():
         assert inventories['nul-name.eml'][0]['archive']['entries'][0]['original_name']=='file\x000000.txt'
         assert inventories['nul-name.eml'][0]['archive']['entries'][0]['unsafe_extraction_path']
         assert inventories['name-budget.eml'][0]['archive']['limited_name_count']>0
+        if sys.version_info >= (3,12):
+            assert inventories['unicode-large.eml'][0]['archive']['limited_name_count']==1
+            assert inventories['unicode-large.eml'][0]['archive']['macro_container_entries']==[]
+            assert inventories['unicode-budget.eml'][0]['archive']['limited_name_count']>0
+            assert inventories['unicode-paths.eml'][0]['archive']['entries'][0]['name']=='../evil.txt'
+            assert inventories['unicode-paths.eml'][0]['archive']['entries'][0]['unsafe_extraction_path']
+        else:
+            assert inventories['unicode-large.eml'][0]['archive']['entries'][0]['name']=='a'
 
         root=base/'http'; root.mkdir()
         with socket.socket() as listener:
@@ -175,7 +207,8 @@ def main():
                     try: request('/health'); break
                     except (urllib.error.URLError,TimeoutError): time.sleep(.1)
                 else: raise TimeoutError('API startup')
-                for name in ('over-count.eml','broken.eml','nul-name.eml','name-budget.eml','unsupported-reader.eml'):
+                for name in ('over-count.eml','broken.eml','nul-name.eml','name-budget.eml','unsupported-reader.eml',
+                             'unicode-large.eml','unicode-budget.eml','unicode-paths.eml'):
                     raw=samples[name]; boundary='paw_archive_inventory_fixture'
                     upload=(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\nContent-Type: message/rfc822\r\n\r\n'.encode()
                         +raw+f'\r\n--{boundary}--\r\n'.encode())
@@ -193,7 +226,7 @@ def main():
                     case=root/'cases'/state['case_ids'][0]; items=check_case(case,raw)
                     detail=json.loads(request('/api/cases/'+case.name))
                     assert detail['attachments']==items
-                    assert detail['coverage']['stages']['attachment_metadata']['status']==('partial' if name!='nul-name.eml' else 'completed')
+                    assert detail['coverage']['stages']['attachment_metadata']['status']==('partial' if any(item['status']=='partial' for item in items) else 'completed')
                     with zipfile.ZipFile(io.BytesIO(request('/api/export/'+case.name))) as archive:
                         assert archive.read('input.eml')==raw
                         assert json.loads(archive.read('attachments.json'))==items
@@ -202,7 +235,7 @@ def main():
                 server.terminate()
                 try: server.wait(timeout=15)
                 except subprocess.TimeoutExpired: server.kill(); server.wait(timeout=15)
-    print('PASS: 14 actual full CLI cases and five loopback HTTP workers; ZIP prefix/name budgets, original names, partial coverage, unsupported-reader continuation, member-metadata-only boundaries, exact payloads, seals, API and ZIP. Offline; constructed inputs are not accuracy labels.')
+    print('PASS: 18 actual full CLI cases and eight loopback HTTP workers; ZIP prefix/name budgets, both parser views including Unicode Path extras, partial coverage, unsupported-reader continuation, member-metadata-only boundaries, exact payloads, seals, API and ZIP. Offline; constructed inputs are not accuracy labels.')
 
 
 if __name__=='__main__': main()
