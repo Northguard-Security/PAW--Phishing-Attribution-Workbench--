@@ -184,3 +184,9 @@ jobs:
 
       - name: Verify actual offline MIME body evidence and sealed HTTP exports
         run: python tests/integration_mime_body_evidence_real.py
+
+      - name: Verify bounded MIME tree header inventories
+        run: python -m unittest discover -s tests -p 'test_mime_header_inventory.py' -v
+
+      - name: Verify actual offline MIME tree headers and sealed HTTP exports
+        run: python tests/integration_mime_header_inventory_real.py

@@ -334,6 +334,11 @@ with ordered duplicate occurrences, raw parser-value octets, derived text and
 explicit limits. It preserves the existing selected-header, scoring and
 authentication contracts; arbitrary header claims remain unverified.
 
+New cases additionally expose the [MIME tree header inventory](mime-header-inventory.md)
+for part/container and encapsulated parser-node headers. Ordered fields retain
+separate inner-message scope, raw/derived provenance and global capture budgets.
+The original top-level inventory and selected analysis contracts remain available.
+
 ## Local DKIM public key evidence
 
 Analysis presets accept `--dkim-keys` and HTTP analysis accepts `options.dkim_keys`.
