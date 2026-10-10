@@ -52,7 +52,7 @@ example:
 | `quoted-printable` | Escape/line/literal checks below; recovery and unsupported padding remain partial. |
 | Four uuencode aliases | Parser decoding/fallback and selected-block terminator; recovered truncated streams remain partial. This is a framing check, not a complete uuencode grammar validator. |
 | Unknown, empty, duplicate | Undecoded unsupported declaration or explicit first-header interpretation, always partial. |
-| Embedded message | Derived serialization, kept in attachment scope rather than outer body. |
+| Embedded message | Original-wire identity-domain checks for `message/rfc822`; derived serialization stays in attachment scope. Missing/ambiguous mapping or unhandled transfer interpretation is explicitly partial. |
 
 Completion describes the implemented extraction/checks and their recorded
 defects; it does not establish complete transfer-format conformance for every
@@ -85,6 +85,21 @@ in the existing attachment path. MIME containers are metadata, not body files.
 An empty inventory completes within this supported scope; it does not prove
 complete MIME parsing or attachment analysis. Full MIME coverage remains separate.
 
+For `message/rfc822` attachments, the identity-domain check uses the original
+encapsulated-message bytes, including its headers. Checking `child.as_bytes()`
+would conceal changes made by folding headers or normalizing line breaks.
+The bounded parser retains its original source. A framing-only lookup follows
+multipart delimiters that match its existing tree, keeps offset/count bounds and
+does not enter the embedded message or decode it again. Missing/ambiguous framing,
+duplicate or unhandled transfer declarations, objects without a bound original,
+and other unvalidated `message/*` subtypes remain explicitly partial as
+`derived_embedded_message_transfer_unavailable`. Invalid original identity bytes
+use `derived_embedded_message_invalid_transfer_domain`. Both retain the existing
+derived serialization rather than mislabeling it as unchanged wire bytes.
+Valid supported identity domains retain `derived_embedded_message_serialization`.
+This checks the enclosing attachment's transfer domain; it does not claim full
+content/format validation of the encapsulated email or fetch external bodies.
+
 The existing input, part/depth, decoded-byte and text-byte limits apply before
 persistence. Supported body payloads share the 2 MiB text-byte budget; retaining
 them does not introduce unbounded reads or a second decoder. Persisted UTF-8 text
@@ -100,7 +115,7 @@ ZIP exports include all new files. Historical cases without it remain readable.
 Contract tests cover original octets versus derived text, alternatives, attached
 scope, malformed base64, unsupported/failed/duplicate transfer declarations,
 empty/JavaScript payloads and safe exclusive writes.
-The real integration runs twenty-seven actual supervised `full --no-egress` CLI cases
-and twelve loopback HTTP workers, independently checking payload bytes, charset text,
+The real integration runs thirty-three actual supervised `full --no-egress` CLI cases
+and fourteen loopback HTTP workers, independently checking payload bytes, charset text,
 part mappings, original MIME, seals and API/ZIP exports. Constructed messages are
 regression inputs, not a classifier accuracy corpus.

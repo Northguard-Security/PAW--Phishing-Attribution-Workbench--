@@ -96,6 +96,12 @@ def main():
     nested.add_attachment('Text attachment',filename='../../letter.txt')
     nested.add_attachment(b'PNG fixture',maintype='image',subtype='png',disposition='inline')
     truncated_uu = b'begin 644 fixture\r\n'+binascii.b2a_uu(b'Hello')
+    inner = b'From: inner@example.invalid\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\nCaf\xe9'
+    embedded = b'Content-Type: message/rfc822\r\nContent-Disposition: attachment; filename="a.eml"\r\n'
+    invalid_embedded = embedded+b'Content-Transfer-Encoding: 7bit\r\n\r\n'+inner
+    valid_embedded = embedded+b'Content-Transfer-Encoding: 8bit\r\n\r\n'+inner
+    siblings = (b'Content-Type: multipart/mixed; boundary=nested\r\n\r\n--nested\r\n'+valid_embedded
+                +b'\r\n--nested\r\n'+invalid_embedded+b'\r\n--nested--')
     samples = {
         'alternatives.eml':alternative.as_bytes(), 'nested.eml':nested.as_bytes(),
         'unknown-charset.eml':prefix+b'Content-Type: text/html; charset=unknown-charset\r\n\r\n<b>a\xffb</b>',
@@ -117,6 +123,12 @@ def main():
         'valid-8bit.eml':prefix+b'Content-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: 8bit\r\n\r\nCaf\xe9\r\n',
         'valid-binary-body.eml':prefix+b'Content-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: binary\r\n\r\n'+bytes(range(256)),
         'valid-binary-attachment.eml':prefix+b'Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="a.bin"\r\nContent-Transfer-Encoding: binary\r\n\r\n'+bytes(range(256)),
+        'embedded-invalid-7bit.eml':prefix+invalid_embedded,
+        'embedded-valid-8bit.eml':prefix+valid_embedded,
+        'embedded-invalid-8bit-header.eml':prefix+embedded+b'Content-Transfer-Encoding: 8bit\r\n\r\nFrom: '+b'a'*999+b'\r\n\r\nHello',
+        'embedded-duplicate.eml':prefix+embedded+b'Content-Transfer-Encoding: 8bit\r\nContent-Transfer-Encoding: binary\r\n\r\n'+inner,
+        'embedded-unhandled.eml':prefix+embedded+b'Content-Transfer-Encoding: base64\r\n\r\nRnJvbTogaW5uZXJAZXhhbXBsZS5pbnZhbGlkDQoNCkhlbGxv',
+        'embedded-nested.eml':prefix+b'Content-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\n'+siblings+b'\r\n--outer--\r\n',
         'duplicate-transfer.eml':prefix+b'Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nSGVsbG8=',
         'unknown-attachment-transfer.eml':prefix+b'Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="a.bin"\r\nContent-Transfer-Encoding: x-foo\r\n\r\nhello=3Dworld',
         'broken-multipart.eml':prefix+b'Content-Type: multipart/mixed; boundary=missing\r\n\r\nundelimited',
@@ -167,6 +179,32 @@ def main():
             assert 'transfer_decoding' not in field
             assert (case/field['evidence_path']).read_bytes() == bytes(range(256))
             assert read(case/'mime_analysis.json')['status'] == 'completed'
+        if name.startswith('embedded-'):
+            # Derived serialization must remain distinct from the original
+            # domain checked above; independently reproduce only that artifact.
+            parsed = BytesParser(policy=policy.default).parsebytes(samples[name])
+            parts = [part for part in parsed.walk() if part.get_content_type() == 'message/rfc822']
+            expected_sources = {
+                'embedded-invalid-7bit.eml':['derived_embedded_message_invalid_transfer_domain'],
+                'embedded-valid-8bit.eml':['derived_embedded_message_serialization'],
+                'embedded-invalid-8bit-header.eml':['derived_embedded_message_invalid_transfer_domain'],
+                'embedded-duplicate.eml':['derived_embedded_message_transfer_unavailable'],
+                'embedded-unhandled.eml':['derived_embedded_message_transfer_unavailable'],
+                'embedded-nested.eml':['derived_embedded_message_serialization','derived_embedded_message_invalid_transfer_domain']}[name]
+            fields = read(case/'attachments.json')
+            assert len(fields) == len(parts) == len(expected_sources)
+            for field, part, source in zip(fields, parts, expected_sources):
+                expected = b'\r\n'.join(child.as_bytes() for child in part.get_payload())
+                assert (case/field['evidence_path']).read_bytes() == expected
+                assert field['byte_source'] == source
+                valid = source == 'derived_embedded_message_serialization'
+                assert field['status'] == ('metadata_only' if valid else 'partial')
+                if not valid: assert field['transfer_decoding']['status'] == 'partial'
+            status = 'completed' if name == 'embedded-valid-8bit.eml' else 'partial'
+            assert read(case/'mime_analysis.json')['status'] == status
+            if status == 'partial':
+                assert read(case/'analysis_coverage.json')['stages']['attachment_metadata']['status'] == 'partial'
+            assert inventory['part_count'] == 0
     with tempfile.TemporaryDirectory(prefix='paw-mime-body-',dir=REPO.parent) as temporary:
         base = Path(temporary).resolve(); inputs = base/'inputs'; inputs.mkdir()
         for name,raw in samples.items(): (inputs/name).write_bytes(raw)
@@ -214,7 +252,8 @@ def main():
                 for name in ('alternatives.eml','unknown-charset.eml','unknown-transfer.eml','failed-uuencode.eml',
                              'unknown-attachment-transfer.eml','truncated-uuencode.eml','truncated-attachment-uuencode.eml',
                              'bad-qp-eof.eml','bad-attachment-qp.eml',
-                             'invalid-7bit.eml','invalid-8bit-line.eml','invalid-7bit-attachment.eml'):
+                             'invalid-7bit.eml','invalid-8bit-line.eml','invalid-7bit-attachment.eml',
+                             'embedded-invalid-7bit.eml','embedded-nested.eml'):
                     raw = samples[name]; boundary = 'paw_mime_body_fixture'
                     upload = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\nContent-Type: message/rfc822\r\n\r\n'.encode()+raw+f'\r\n--{boundary}--\r\n'.encode())
                     uploaded = json.loads(request('/api/upload','POST',upload,'multipart/form-data; boundary='+boundary))
@@ -244,7 +283,7 @@ def main():
                 server.terminate()
                 try: server.wait(timeout=15)
                 except subprocess.TimeoutExpired: server.kill(); server.wait(timeout=15)
-    print('PASS: twenty-seven actual full CLI cases and twelve loopback HTTP workers; per-part bytes/charset text/provenance, alternatives, explicit partial transfer/charset decoding, unknown/failed/duplicate transfer declarations, truncated uuencode, malformed quoted-printable and identity transfer domains in bodies and attachments, valid 8bit/binary, nested/unsupported scope, empty and unexecuted JS sources, original MIME/seals/API ZIP. No-egress; not accuracy labels.')
+    print('PASS: thirty-three actual full CLI cases and fourteen loopback HTTP workers; per-part bytes/charset text/provenance, alternatives, explicit partial transfer/charset decoding, unknown/failed/duplicate transfer declarations, truncated uuencode, malformed quoted-printable and identity transfer domains in bodies and attachments, embedded original-wire domain checks with unchanged derived serialization, valid 8bit/binary, nested/unsupported scope, empty and unexecuted JS sources, original MIME/seals/API ZIP. No-egress; not accuracy labels.')
 
 
 if __name__ == '__main__': main()

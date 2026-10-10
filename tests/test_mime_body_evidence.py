@@ -1,13 +1,14 @@
 """MIME body-byte provenance; constructed inputs are not accuracy labels."""
 from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 import binascii
 import hashlib
 from pathlib import Path
 import tempfile
 import unittest
 
-from paw.core.mime_analysis import analyze_mime
+from paw.core.mime_analysis import analyze_mime, embedded_wire_payloads, MimeLimits, MimeLimitExceeded
 from paw.core.attach import scan_attachments
 from paw.core.mime_body_evidence import preserve_body_parts
 from paw.core.parser_mail import parse_message_bytes
@@ -72,6 +73,109 @@ class MimeBodyEvidenceTests(unittest.TestCase):
                 else:
                     self.assertEqual(field['byte_source'], 'identity_bytes_invalid_transfer_domain')
                     self.assertEqual(field['transfer_decoding']['status'], 'partial')
+
+    def test_embedded_message_transfer_domains_use_original_bytes(self):
+        for cte, body, valid in self.identity_fixtures():
+            declaration = b'' if cte is None else b'Content-Transfer-Encoding: '+cte+b'\r\n'
+            inner = b'From: inner@example.invalid\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\n'+body
+            raw = (b'Content-Type: message/rfc822\r\nContent-Disposition: attachment; filename="a.eml"\r\n'
+                   +declaration+b'\r\n'+inner)
+            for wrapped in (False, True):
+                wire = (b'Content-Type: multipart/mixed; boundary=outer\r\n\r\npreamble\r\n--outer\r\n'
+                        +raw+b'\r\n--outer--\r\nepilogue') if wrapped else raw
+                with self.subTest(cte=cte, size=len(body), valid=valid, wrapped=wrapped), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    message = parse_message_bytes(wire)
+                    part = message.get_payload()[0] if wrapped else message
+                    # Independent stdlib serialization remains the derived artifact,
+                    # even when its line/header normalization hides a wire violation.
+                    expected = b'\r\n'.join(child.as_bytes() for child in part.get_payload())
+                    result = analyze_mime(message)
+                    self.assertEqual(result['body_parts'], [])
+                    field, = scan_attachments(None, result, root/'attachments')
+                    self.assertEqual((root/field['evidence_path']).read_bytes(), expected)
+                    self.assertEqual(field['status'], 'metadata_only' if valid else 'partial')
+                    self.assertEqual(result['metadata']['status'], 'completed' if valid else 'partial')
+                    self.assertEqual(field['byte_source'], 'derived_embedded_message_serialization' if valid else 'derived_embedded_message_invalid_transfer_domain')
+                    if not valid:
+                        self.assertEqual(field['transfer_decoding']['status'], 'partial')
+                        self.assertEqual(field['transfer_decoding']['declared_encodings'], [] if cte is None else [cte.decode()])
+
+    def test_embedded_normalization_cannot_hide_invalid_wire_headers_or_breaks(self):
+        inner_messages = [b'From: '+b'a'*999+b'\r\n\r\nHello',
+                          b'From: inner@example.invalid\n\nHello']
+        for inner in inner_messages:
+            raw = b'Content-Type: message/rfc822\r\nContent-Transfer-Encoding: 7bit\r\n\r\n'+inner
+            with self.subTest(inner_size=len(inner)):
+                result = analyze_mime(parse_message_bytes(raw))
+                field, = result['attachments']
+                self.assertEqual(field['byte_source'], 'derived_embedded_message_invalid_transfer_domain')
+                self.assertEqual(result['metadata']['status'], 'partial')
+
+    def test_embedded_ambiguous_or_unhandled_transfer_is_partial(self):
+        for declarations in (b'Content-Transfer-Encoding: base64\r\n',
+                b'Content-Transfer-Encoding: quoted-printable\r\n',
+                b'Content-Transfer-Encoding: x-foo\r\n', b'Content-Transfer-Encoding:\r\n',
+                b'Content-Transfer-Encoding: 7bit\r\nContent-Transfer-Encoding: binary\r\n'):
+            raw = b'Content-Type: message/rfc822\r\n'+declarations+b'\r\nFrom: inner@example.invalid\r\n\r\nHello'
+            with self.subTest(declarations=declarations):
+                result = analyze_mime(parse_message_bytes(raw))
+                field, = result['attachments']
+                self.assertEqual(field['byte_source'], 'derived_embedded_message_transfer_unavailable')
+                self.assertEqual(field['transfer_decoding']['status'], 'partial')
+                self.assertEqual(result['metadata']['status'], 'partial')
+
+    def test_embedded_wire_mapping_nested_siblings_and_exact_boundaries(self):
+        valid = b'From: first@example.invalid\r\n\r\nHello\r\n'
+        invalid = b'From: second@example.invalid\r\n\r\nCaf\xe9'
+        embedded = b'Content-Type: message/rfc822\r\nContent-Transfer-Encoding: 7bit\r\n\r\n'
+        for marker in (b'in ner', b'a'*70, b'a.+:=?'):
+            inner = (b'Content-Type: multipart/mixed; boundary="'+marker+b'"\r\n\r\n'
+                     +b'--'+marker+b'\r\n'+embedded+valid+b'\r\n'
+                     +b'--'+marker+b' \t\r\n'+embedded+invalid+b'\r\n--'+marker+b'--')
+            wire = b'Content-Type: multipart/mixed; boundary=out\r\n\r\n--out\r\n'+inner+b'\r\n--out--\r\n'
+            with self.subTest(marker=marker):
+                message = parse_message_bytes(wire)
+                children = message.get_payload()[0].get_payload()
+                mappings = embedded_wire_payloads(message, MimeLimits())
+                self.assertEqual([mappings[id(child)] for child in children], [valid, invalid])
+                result = analyze_mime(message)
+                first, second = scan_attachments(None, result)
+                self.assertEqual(first['status'], 'metadata_only')
+                self.assertEqual(second['status'], 'partial')
+                self.assertEqual(first['part_id'], '0.0.0')
+                self.assertEqual(second['part_id'], '0.0.1')
+
+    def test_embedded_unavailable_wire_mapping_is_explicit_and_bounded(self):
+        embedded = b'Content-Type: message/rfc822\r\n\r\nFrom: inner@example.invalid\r\n\r\nHello'
+        # External/synthetic parser objects lack the original-byte binding.
+        result = analyze_mime(BytesParser(policy=policy.default).parsebytes(embedded))
+        self.assertEqual(result['attachments'][0]['byte_source'], 'derived_embedded_message_transfer_unavailable')
+        self.assertEqual(result['metadata']['status'], 'partial')
+        wire = b'Content-Type: multipart/mixed; boundary=out\r\n\r\n--out\r\n'+embedded
+        result = analyze_mime(parse_message_bytes(wire))
+        self.assertEqual(result['attachments'][0]['byte_source'], 'derived_embedded_message_transfer_unavailable')
+        self.assertEqual(result['metadata']['status'], 'partial')
+        message = parse_message_bytes(embedded)
+        with self.assertRaises(MimeLimitExceeded):
+            analyze_mime(message, MimeLimits(max_input_bytes=len(embedded)-1))
+        for content_type in (b'message/partial', b'message/external-body', b'message/global'):
+            raw = embedded.replace(b'message/rfc822', content_type, 1)
+            with self.subTest(content_type=content_type):
+                result = analyze_mime(parse_message_bytes(raw))
+                self.assertEqual(result['attachments'][0]['byte_source'], 'derived_embedded_message_transfer_unavailable')
+                self.assertEqual(result['metadata']['status'], 'partial')
+        malformed = b'Content-Type: message/rfc822\r\ninvalid header line\r\n\r\nFrom: inner@example.invalid\r\n\r\nHello'
+        result = analyze_mime(parse_message_bytes(malformed))
+        self.assertEqual(result['attachments'][0]['byte_source'], 'derived_embedded_message_transfer_unavailable')
+        self.assertEqual(result['metadata']['status'], 'partial')
+        digest = b'Content-Type: multipart/digest; boundary=out\r\n\r\n--out\r\n\r\nFrom: inner@example.invalid\r\n\r\nHello\r\n--out--\r\n'
+        result = analyze_mime(parse_message_bytes(digest))
+        self.assertEqual(result['attachments'][0]['byte_source'], 'derived_embedded_message_serialization')
+        self.assertNotIn('transfer_decoding', result['attachments'][0])
+        # An implicitly attached non-body type still has unevaluated content;
+        # that existing limitation is separate from the valid transfer domain.
+        self.assertEqual(result['metadata']['status'], 'partial')
 
     def preserve(self, raw, directory):
         result = analyze_mime(parse_message_bytes(raw))

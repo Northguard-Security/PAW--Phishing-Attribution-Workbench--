@@ -101,20 +101,93 @@ def identity_transfer_is_valid(payload, cte):
     return all(len(line) <= 998 for line in payload.split(b'\r\n'))
 
 
-def decoded_payload(part):
+def embedded_wire_payloads(message, limits):
+    """Locate embedded attachment bodies in the bounded original wire source.
+
+    Follow only multipart framing matching the existing parser tree. Never
+    reconstruct a wire payload from serialization or descend into its embedded
+    message. Ambiguous/missing framing leaves the transfer check unavailable.
+    Offsets and delimiter counts are bounded; no per-line list or second decoder.
+    """
+    raw = getattr(message, '_paw_source_bytes', None)
+    if not isinstance(raw, bytes):
+        return {}
+    if len(raw) > limits.max_input_bytes:
+        raise MimeLimitExceeded('Input email byte limit exceeded')
+    bodies = {}
+    stack = [(message, 0, len(raw))]
+    newlines = re.compile(rb'\r\n|\r|\n')
+    while stack:
+        part, start, end = stack.pop()
+        # The parser may have promoted a malformed header line into the body
+        # before any blank separator. A later separator cannot locate that body.
+        if any(type(d).__name__ == 'MissingHeaderBodySeparatorDefect' for d in part.defects):
+            continue
+        previous = start
+        for newline in newlines.finditer(raw, start, end):
+            if newline.start() == previous:
+                body_start = newline.end()
+                break
+            previous = newline.end()
+        else:
+            continue
+        if part.get_content_maintype() == 'message':
+            bodies[id(part)] = raw[body_start:end]
+            continue
+        children = part.get_payload()
+        if part.get_content_maintype() != 'multipart' or not isinstance(children, list):
+            continue
+        boundary = part.get_boundary()
+        if not boundary:
+            continue
+        try:
+            marker = boundary.encode('ascii')
+        except UnicodeError:
+            continue
+        if not re.fullmatch(rb"[0-9A-Za-z'()+_,./:=? -]{1,70}", marker) or marker.endswith(b' '):
+            continue
+        delimiters = re.compile(rb'(?:\A|(?<=\r)|(?<=\n))--'+re.escape(marker)
+                                +rb'(?P<close>--)?[ \t]*(?:\r\n|\r|\n|\Z)')
+        spans, child_start, closed = [], None, False
+        for delimiter in delimiters.finditer(raw, body_start, end):
+            if child_start is not None:
+                child_end = delimiter.start()
+                if raw[max(child_start, child_end-2):child_end] == b'\r\n':
+                    child_end -= 2
+                elif child_end > child_start and raw[child_end-1:child_end] in (b'\r', b'\n'):
+                    child_end -= 1
+                spans.append((child_start, child_end))
+                if len(spans) > len(children):
+                    break
+            if delimiter.group('close'):
+                closed = True
+                break
+            child_start = delimiter.end()
+        if closed and len(spans) == len(children):
+            stack.extend((child, a, b) for child, (a, b) in zip(children, spans))
+    return bodies
+
+
+def decoded_payload(part, embedded_wire=None):
+    declarations = part.get_all('Content-Transfer-Encoding', [])
+    header = part.get('Content-Transfer-Encoding', '')
+    cte = getattr(header, 'cte', str(header).strip().lower()) if str(header).strip() else ''
     if part.get_content_maintype() == 'message':
         payload = part.get_payload()
         if isinstance(payload, list):
-            return b'\r\n'.join(child.as_bytes() for child in payload), 'derived_embedded_message_serialization'
+            derived = b'\r\n'.join(child.as_bytes() for child in payload)
+            if (part.get_content_type() != 'message/rfc822' or len(declarations) > 1
+                    or (declarations and cte not in {'7bit', '8bit', 'binary'}) or embedded_wire is None):
+                return derived, 'derived_embedded_message_transfer_unavailable'
+            if not identity_transfer_is_valid(embedded_wire, cte if declarations else '7bit'):
+                return derived, 'derived_embedded_message_invalid_transfer_domain'
+            return derived, 'derived_embedded_message_serialization'
     payload = part.get_payload(decode=True)
     if payload is None:
         if part.is_multipart(): return None, 'container'
         raw = part.get_payload()
         if isinstance(raw, str): return raw.encode('utf-8', errors='surrogateescape'), 'fallback_utf8_serialization'
         return b'', 'empty'
-    declarations = part.get_all('Content-Transfer-Encoding', [])
-    header = part.get('Content-Transfer-Encoding', '')
-    cte = getattr(header, 'cte', str(header).strip().lower()) if str(header).strip() else ''
     # The stdlib selects the first occurrence. Retain its representation, but
     # don't claim an unambiguous successful transfer decoding for duplicates.
     if len(declarations) > 1:
@@ -145,6 +218,8 @@ def decoded_payload(part):
 
 
 TRANSFER_PARTIAL_REASONS = {
+    'derived_embedded_message_invalid_transfer_domain': 'Original embedded-message bytes violate the declared/default identity transfer domain; derived serialization retained',
+    'derived_embedded_message_transfer_unavailable': 'Embedded-message wire mapping or unambiguous supported transfer interpretation unavailable; derived serialization retained',
     'identity_bytes_invalid_transfer_domain': 'Payload violates declared 7bit/8bit transfer domain (absent declaration defaults to 7bit); unchanged parser bytes retained',
     'undecoded_unsupported_transfer_encoding': 'Unsupported or empty declared transfer encoding; parser payload retained undecoded',
     'undecoded_failed_transfer_encoding': 'Transfer decoder returned undecoded parser payload',
@@ -199,14 +274,16 @@ class HtmlEvidenceParser(HTMLParser):
 
 def analyze_mime(message, limits=MimeLimits()):
     # Validate embedded trees too, before serializing them as attachment evidence.
-    stack, count = [(message, 0)], 0
+    stack, count, has_embedded = [(message, 0)], 0, False
     while stack:
         part, depth = stack.pop()
         count += 1
         if count > limits.max_parts or depth > limits.max_depth:
             raise MimeLimitExceeded('MIME part/depth limit exceeded')
         payload = part.get_payload()
+        has_embedded |= part.get_content_maintype() == 'message' and isinstance(payload, list)
         if isinstance(payload, list): stack.extend((child, depth + 1) for child in payload)
+    wire_payloads = embedded_wire_payloads(message, limits) if has_embedded else {}
     parts, text, html, javascript, urls, attachments, issues = [], [], [], [], [], [], []
     body_parts = []
     decoded_total, text_total = 0, 0
@@ -221,7 +298,7 @@ def analyze_mime(message, limits=MimeLimits()):
             parts.append(item)
             if item['defects']: issues.append({'part_id':path, 'defects':item['defects']})
             continue
-        payload, byte_source = decoded_payload(part)
+        payload, byte_source = decoded_payload(part, wire_payloads.get(id(part)))
         if payload is None: payload = b''
         decoded_total += len(payload)
         if decoded_total > limits.max_decoded_bytes:
